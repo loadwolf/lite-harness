@@ -1,240 +1,306 @@
-# Adding a New Harness
+# Adding a New Harness Provider
 
-A harness wraps an agent backend (an SDK, CLI, or child process) and exposes it
-through the unified adapter's HTTP surface. This guide walks through everything
-you need to add one without breaking the build or the UI.
+This guide shows how to add a new harness provider to the lite-harness SDK server.
 
----
-
-## 1. Create the harness directory
-
-```
-harnesses/<name>/
-  package.json        ← harness-specific deps (SDK, etc.)
-  inline-adapter.mjs  ← standalone HTTP server (optional — for standalone mode)
-  start-local.sh      ← local dev runner
-```
-
-The unified adapter (`harnesses/opencode/inline-adapter.mjs`) is the single
-entry point in production. Your harness code runs **inside** that adapter, not
-as a separate process.
+> **Architecture Note:** This repo uses an **SDK server** architecture, not the older
+> inline-adapter pattern. Providers are **auto-discovered** from `src/sdk/server/providers/`.
+> No central registry edits needed.
 
 ---
 
-## 2. Install your SDK deps locally
+## Quick Start
+
+Use the example provider as a template:
 
 ```bash
-cd harnesses/<name>
-npm install
+# Copy the stub
+cp -r src/sdk/server/providers/custom src/sdk/server/providers/my-harness
+
+# Edit index.mjs and transformation.mjs (TODOs marked inline)
+# Replace "custom" with your provider id
+
+# Verify discovery
+node -e "import('./src/sdk/server/providers/index.mjs').then(m => m.loadProviders().then(p => console.log([...p.keys()])))"
 ```
 
-The unified adapter loads your SDK via a relative path:
-
-```js
-const sdkPath = _require.resolve("../<name>/node_modules/your-sdk");
-```
-
-This works in local dev because `harnesses/<name>/node_modules/` exists on disk.
+Your provider is now available by its `id` or any `aliases`.
 
 ---
 
-## 3. Add a build stage to the Dockerfile
+## Provider Structure
 
-**This is the step most likely to be missed.**
+A provider is a folder under `src/sdk/server/providers/` containing:
 
-The Docker image doesn't automatically include `harnesses/<name>/node_modules/`.
-You must add an explicit build stage and COPY it in.
-
-Open the root `Dockerfile` and add:
-
-```dockerfile
-# ============================================================== <name> SDK
-FROM node:20-bookworm-slim AS <name>-deps
-WORKDIR /<name>
-COPY harnesses/<name>/package.json ./package.json
-RUN npm install --omit=dev --no-audit --no-fund
+```
+my-harness/
+├── index.mjs           → Provider runtime (SDK integration)
+├── transformation.mjs  → Event-to-frame mapping (pure, testable)
+└── README.md           → Optional: usage notes
 ```
 
-Then in the **runtime** stage, add a COPY that mirrors the local-dev path
-(the adapter resolves from `/opt/lap/`, so `../<name>/` = `/opt/<name>/`):
+### `index.mjs` — Provider Runtime
 
-```dockerfile
-COPY --from=<name>-deps --chown=sandbox:sandbox /<name>/node_modules /opt/<name>/node_modules
-```
-
-If you skip this, the adapter logs `<name> SDK not available` at boot and
-`POST /session {"harness":"<name>"}` returns `503`.
-
----
-
-## 4. Wire routing in the unified adapter
-
-In `harnesses/opencode/inline-adapter.mjs`:
-
-### Load your SDK (top-level, after existing SDK loads)
+**Required exports:**
 
 ```js
-let myQuery;
-try {
-  const sdkPath = _require.resolve("../<name>/node_modules/your-sdk");
-  myQuery = (await import(sdkPath)).query;
-  log("<name> SDK loaded");
-} catch (e) {
-  log(`<name> SDK not available: ${e.message}`);
+export const id = "my-harness";                    // Canonical identifier
+export const aliases = ["my", "myharness"];        // Optional: alternate names
+export const displayName = "My Harness";           // Optional: UI-friendly name
+
+export function createRuntime({ model, permissionMode, cwd, env, diagnostics }) {
+  // Initialize your SDK
+  
+  return {
+    get model() { return currentModel; },
+    setModel(next) { /* update model */ },
+    setPermissionMode(next) { /* update permission mode */ },
+    interrupt() { /* abort turn */ },
+    
+    async *runTurn({ prompt, session }) {
+      // Run agent turn, yield frames
+      for await (const event of yourSDK.stream(prompt)) {
+        for (const frame of toFrames(event, { sessionId: session.sessionId })) {
+          yield frame;
+        }
+      }
+    }
+  };
 }
 ```
 
-### Add session state
+### `transformation.mjs` — Event Mapping
+
+Keep this **pure** (no network, no state) for testability:
 
 ```js
-const mySessions = new Map();   // id → { id, title, time, history, busSubscribers, ... }
-const myGlobalBus = new Set();  // SSE writers
-```
-
-### POST /session — handle your harness value
-
-```js
-if (harness === "<name>") {
-  if (!myQuery) { res.writeHead(503); res.end(JSON.stringify({ error: "<name> SDK not available" })); return; }
-  const id = `ses_${randomUUID().replace(/-/g,"").slice(0,24)}`;
-  const s = { id, title: body.title || "New session", time: { created: Date.now() }, history: [], busSubscribers: new Set() };
-  mySessions.set(id, s);
-  sessionHarness.set(id, "<name>");
-  res.writeHead(200, { "content-type": "application/json" });
-  res.end(JSON.stringify({ id, title: s.title, time: s.time, harness: "<name>" }));
-  return;
+export function toFrames(providerEvent, { sessionId }) {
+  // Map SDK events to wire frames
+  if (providerEvent.type === "delta") {
+    return [{
+      type: "stream_event",
+      session_id: sessionId,
+      event: {
+        type: "content_block_delta",
+        delta: { type: "text_delta", text: providerEvent.text }
+      }
+    }];
+  }
+  return [];
 }
-```
-
-### Route prompt_async and GET message
-
-In the `isMessagePath` block, add a check before the opencode fallthrough:
-
-```js
-if (sid && sessionHarness.get(sid) === "<name>") {
-  // handle in-process
-}
-```
-
-### Emit SSE events
-
-Emit the same shapes as opencode/cc so the UI works without changes:
-
-```js
-myEmit(sessionId, "message.part.delta", { messageID, partID, field: "text", delta });
-myEmit(sessionId, "session.idle", {});
-```
-
-**Critical**: emit `message.part.updated` with `text: ""` on `content_block_start`
-(or equivalent) **before** any deltas. The UI's delta handler looks up the part
-by ID and silently drops deltas if the part doesn't exist yet.
-
-### Wire your bus into GET /event
-
-In the `/event` SSE handler, register your global bus alongside the existing cc bus:
-
-```js
-const myPush = (line) => { try { res.write(line); } catch {} };
-myGlobalBus.add(myPush);
-req.on("close", () => myGlobalBus.delete(myPush));
 ```
 
 ---
 
-## 5. Extend the UI types
+## Auto-Discovery
 
-In `ui/src/lib/types.ts`, add your harness ID to the union:
+The registry (`providers/index.mjs`) scans each subfolder for:
 
-```ts
-export interface OpencodeSession {
-  harness?: "opencode" | "claude-code" | "<name>";
-  // ...
-}
-```
+1. An `index.mjs` file
+2. Exports: `id` (string) and `createRuntime` (function)
 
-And in `ui/src/components/sidebar.tsx` + `ui/src/app/chat/page.tsx` / `sessions/page.tsx`,
-add a `SelectItem` for it.
+When both are present, the provider is registered by `id` and all `aliases`.
 
----
+**No other files need changes.** Adding a provider = dropping a folder.
 
-## 6. Rebuild the UI and commit
+### External Providers
+
+Load providers from outside this repo:
 
 ```bash
-cd ui && npm run build
-git add Dockerfile harnesses/<name>/ ui/src/ ui/out/
-git commit -m "feat(harness): add <name>"
+export LITE_HARNESS_PROVIDERS_DIR=/path/to/my-providers
+# Both src/sdk/server/providers/ and your directory are scanned
 ```
+
+---
+
+## Session and Runtime Lifecycle
+
+### Session Immutability
+
+Each `Session` instance holds:
+
+- **One provider** (set at creation, never changed)
+- **One model** (can change via `setModel()`)
+- **Permission mode** (can change via `setPermissionMode()`)
+
+**Switching harnesses requires creating a new session.**
+
+### Runtime Interface
+
+Your `createRuntime()` returns an object with:
+
+| Member | Type | Purpose |
+|--------|------|---------|
+| `model` | getter | Returns current model string |
+| `setModel(next)` | method | Updates model mid-session |
+| `setPermissionMode(next)` | method | Updates permission mode |
+| `interrupt()` | method | Aborts current turn |
+| `runTurn({ prompt, session })` | async generator | Yields frames for one turn |
+
+### Frame Types
+
+Your `runTurn()` yields:
+
+- **assistant**: Complete agent response messages
+- **stream_event**: Streaming deltas (text, tool use, thinking, etc.)
+
+**Do not yield `result` frames** — the `Session` class appends them automatically
+with success/error/cancelled status.
+
+---
+
+## Wire Protocol Frames
+
+### Assistant Frame
+
+```js
+{
+  type: "assistant",
+  message: {
+    model: "your-model-name",
+    content: [
+      { type: "text", text: "Response text" },
+      // ... more content blocks
+    ],
+  },
+  parent_tool_use_id: null
+}
+```
+
+### Stream Event Frame
+
+```js
+{
+  type: "stream_event",
+  session_id: "ses_abc123",
+  event: {
+    type: "content_block_delta",  // or "tool_use", "thinking", etc.
+    index: 0,
+    delta: { type: "text_delta", text: "incremental text" }
+  }
+}
+```
+
+See [src/sdk/PROTOCOL.md](../src/sdk/PROTOCOL.md) for the complete specification.
+
+---
+
+## Testing Your Provider
+
+### 1. Pure Transformation (no network)
+
+```js
+import { toFrames } from "./providers/my-harness/transformation.mjs";
+
+const frames = toFrames(
+  { type: "delta", text: "Hello" },
+  { sessionId: "test-session" }
+);
+console.log(frames);
+```
+
+### 2. Provider Discovery
+
+```bash
+node -e "import('./src/sdk/server/providers/index.mjs').then(m => m.loadProviders().then(p => console.log([...p.keys()])))"
+# Should include your provider id and aliases
+```
+
+### 3. Integration Test (Python SDK)
+
+```python
+from lite_harness import query, AgentOptions
+import asyncio
+
+async def test():
+    async for message in query(
+        prompt="test",
+        options=AgentOptions(harness="my-harness", model="test-model")
+    ):
+        print(message)
+
+asyncio.run(test())
+```
+
+### 4. Unit Tests
+
+Add tests to `tests/src/sdk/server/providers/my-harness/transformation.test.mjs`:
+
+```js
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { toFrames } from "../../../../../src/sdk/server/providers/my-harness/transformation.mjs";
+
+test("toFrames: content delta", () => {
+  const frames = toFrames({ type: "delta", text: "hi" }, { sessionId: "s" });
+  assert.equal(frames.length, 1);
+  assert.equal(frames[0].type, "stream_event");
+});
+```
+
+Run with:
+
+```bash
+node --test "tests/src/sdk/server/**/*.test.mjs"
+```
+
+---
+
+## LiteLLM Gateway Support
+
+If your provider calls an LLM API, support routing through LiteLLM:
+
+```js
+function applyLiteLlmEnv(env) {
+  if (!env.LITELLM_API_BASE || !env.LITELLM_API_KEY) return;
+  
+  // Route SDK to LiteLLM gateway
+  yourSDK.baseURL = env.LITELLM_API_BASE.replace(/\/v1$/, "");
+  yourSDK.apiKey = env.LITELLM_API_KEY;
+}
+
+export function createRuntime({ env, ...opts }) {
+  applyLiteLlmEnv(env);
+  // ... rest of runtime
+}
+```
+
+Users can then set:
+
+```bash
+export LITELLM_API_BASE=https://litellm.your-company.com/v1
+export LITELLM_API_KEY=sk-litellm-...
+```
+
+And your provider routes through the gateway automatically (with budgets, logs, fallbacks, etc.).
 
 ---
 
 ## Checklist
 
-- [ ] `harnesses/<name>/package.json` exists
-- [ ] `harnesses/<name>/node_modules/` installed locally (`npm install`) — skip if no deps
-- [ ] Dockerfile has a `<name>-deps` build stage — skip if no npm deps (use native fetch instead)
-- [ ] Dockerfile copies node_modules to `/opt/<name>/node_modules/` in runtime stage — skip if no deps
-- [ ] Adapter loads SDK with try/catch, logs failure gracefully
-- [ ] `POST /session {"harness":"<name>"}` returns `503` when SDK unavailable, `200` when available
-- [ ] `prompt_async` routes to your in-process handler
-- [ ] `GET /session/:id/message` returns your session's history
-- [ ] SSE events emitted: `message.part.updated` (empty) before first delta, `session.idle` on completion
-- [ ] Your bus registered in the `/event` multiplexer
-- [ ] UI types updated, `SelectItem` added, UI rebuilt
-- [ ] Tested locally with `start-local.sh` before pushing
+- [ ] Created `src/sdk/server/providers/<name>/index.mjs` with required exports
+- [ ] Implemented `createRuntime()` with full runtime interface
+- [ ] Created `transformation.mjs` with pure `toFrames()` function
+- [ ] Provider discovered in registry (test with node -e command above)
+- [ ] Frames match wire protocol (assistant, stream_event)
+- [ ] Added unit tests under `tests/src/sdk/server/providers/<name>/`
+- [ ] Tested with Python or TypeScript SDK
+- [ ] Optional: Added LiteLLM gateway support
 
 ---
 
-## BYOK / LiteLLM Proxy Support
+## Examples
 
-Harnesses that call an LLM API should support BYOK (Bring Your Own Key) so users can route
-traffic through a LiteLLM proxy instead of hitting the upstream provider directly.
+For production implementations, see:
 
-### Pattern
+- [`src/sdk/server/providers/anthropic/`](../src/sdk/server/providers/anthropic/) — Drives @anthropic-ai/claude-agent-sdk
+- [`src/sdk/server/providers/codex/`](../src/sdk/server/providers/codex/) — Drives @openai/codex-sdk  
+- [`src/sdk/server/providers/custom/`](../src/sdk/server/providers/custom/) — Minimal stub template
 
-Read two standard env vars before constructing your endpoint:
+---
 
-```js
-const byokBase = process.env.LITELLM_API_BASE;  // e.g. http://localhost:4000/v1
-const byokKey  = process.env.LITELLM_API_KEY;   // your LiteLLM master or virtual key
+## Architecture References
 
-if (byokBase) {
-  // BYOK mode — route to LiteLLM, no provider auth needed
-  url = byokBase.replace(/\/+$/, "") + "/chat/completions";
-  key = byokKey || "";
-} else {
-  // Native mode — use provider-specific auth (token exchange, etc.)
-  url  = "https://api.provider.com/chat/completions";
-  key  = await getProviderToken();
-}
-```
-
-### Session guard
-
-Return `503` only when **neither** BYOK nor native credentials are present:
-
-```js
-if (!process.env.LITELLM_API_BASE && !process.env.PROVIDER_TOKEN) {
-  res.writeHead(503);
-  res.end(JSON.stringify({ error: "<name> requires LITELLM_API_BASE (BYOK) or PROVIDER_TOKEN (native)" }));
-  return;
-}
-```
-
-### Usage
-
-```bash
-# BYOK — point at a running LiteLLM proxy
-export LITELLM_API_BASE=http://localhost:4000/v1
-export LITELLM_API_KEY=sk-...
-# select the harness in the UI — no upstream provider credentials needed
-
-# Native — use the upstream provider directly
-export GITHUB_TOKEN=ghp_...     # (example for github-copilot harness)
-```
-
-### Why this matters
-
-- Teams running LiteLLM already have model routing, rate limits, and audit logs configured.
-- BYOK lets any harness benefit from that without code changes per provider.
-- `LITELLM_API_BASE` and `LITELLM_API_KEY` are already set in many deployments, so
-  harnesses that check them "just work" without additional configuration.
+- [SDK Backend README](../src/sdk/server/README.md) — Server architecture overview
+- [SDK AGENTS.md](../src/sdk/AGENTS.md) — Client SDK constraints and hard rules
+- [Wire Protocol](../src/sdk/PROTOCOL.md) — Full protocol specification
