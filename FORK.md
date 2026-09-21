@@ -42,6 +42,25 @@ Make this fork a solid base for **Agentic Harness development** on LiteLLM while
    - Tests provider discovery and basic runtime initialization
    - Useful for CI or post-install verification
 
+3. **Live Gateway Test** ([scripts/live-gateway-test.sh](./scripts/live-gateway-test.sh))
+   - End-to-end test against real LiteLLM gateway instances
+   - Verified against https://litellm.chat.mq.edu.au
+   - Includes Cloudflare User-Agent workaround ([scripts/ua-preload.mjs](./scripts/ua-preload.mjs))
+   - Creates `.venv` and installs Python SDK automatically
+
+## Cloudflare User-Agent Requirement
+
+Some LiteLLM gateways (including https://litellm.chat.mq.edu.au) sit behind Cloudflare, which returns error 1010 when Node.js's default `fetch()` User-Agent is detected. The fork includes `scripts/ua-preload.mjs` to inject a browser-like User-Agent automatically.
+
+When testing against Cloudflare-protected gateways:
+
+```bash
+export NODE_OPTIONS="--import $PWD/scripts/ua-preload.mjs"
+# Now all fetch() calls include browser-like headers
+```
+
+The live gateway test script applies this automatically.
+
 ## How to Extend This Fork
 
 ### Adding a Custom Harness Provider

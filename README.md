@@ -144,6 +144,31 @@ for await (const message of query({
 }
 ```
 
+## Testing with a Live LiteLLM Gateway
+
+The fork includes a live gateway test script verified against production LiteLLM instances:
+
+```bash
+# Test against a LiteLLM gateway (e.g., Macquarie University's instance)
+LITELLM_API_KEY=sk-your-key-here bash scripts/live-gateway-test.sh
+
+# Customize gateway, model, harness, and prompt
+LITELLM_API_KEY=sk-... \
+LITELLM_API_BASE=https://your-gateway.com/v1 \
+LITELLM_MODEL=azure/gpt-4o \
+HARNESS=pi-ai \
+PROMPT="Test message" \
+bash scripts/live-gateway-test.sh
+```
+
+The script:
+- Verifies gateway reachability with browser-like headers (required for Cloudflare-protected gateways)
+- Creates a Python virtual environment if needed
+- Runs a complete agent turn through the specified harness
+- Reports success/failure
+
+**Note:** Some LiteLLM gateways sit behind Cloudflare, which blocks requests without a browser-like User-Agent. The test script includes `scripts/ua-preload.mjs` to handle this automatically.
+
 ## Syncing from Upstream
 
 This fork tracks [LiteLLM-Labs/lite-harness](https://github.com/LiteLLM-Labs/lite-harness). To sync upstream changes:

@@ -10,3 +10,4 @@ ui/out/
 __pycache__/
 *.pyc
 *.pyo
+.venv/
